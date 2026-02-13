@@ -18,13 +18,22 @@ RUN if [ -n "$OPENCLAW_DOCKER_APT_PACKAGES" ]; then \
 
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc ./
 COPY ui/package.json ./ui/package.json
+COPY packages/clawdbot/package.json ./packages/clawdbot/package.json
+COPY packages/clawdbot/scripts/ ./packages/clawdbot/scripts/
+COPY packages/moltbot/package.json ./packages/moltbot/package.json
+COPY packages/moltbot/scripts/ ./packages/moltbot/scripts/
+# Copy extension package.json files for workspace dependency resolution
+COPY extensions/ ./extensions-tmp/
+RUN mkdir -p extensions && \
+    find extensions-tmp -name 'package.json' -exec sh -c 'dir=$(dirname "$1" | sed "s|extensions-tmp|extensions|"); mkdir -p "$dir" && cp "$1" "$dir/"' _ {} \; && \
+    rm -rf extensions-tmp
 COPY patches ./patches
 COPY scripts ./scripts
 
 RUN pnpm install --frozen-lockfile
 
 COPY . .
-RUN OPENCLAW_A2UI_SKIP_MISSING=1 pnpm build
+RUN pnpm build
 # Force pnpm for UI build (Bun may fail on ARM/Synology architectures)
 ENV OPENCLAW_PREFER_PNPM=1
 RUN pnpm ui:build
@@ -44,5 +53,5 @@ USER node
 #
 # For container platforms requiring external health checks:
 #   1. Set OPENCLAW_GATEWAY_TOKEN or OPENCLAW_GATEWAY_PASSWORD env var
-#   2. Override CMD: ["node","dist/index.js","gateway","--allow-unconfigured","--bind","lan"]
-CMD ["node", "dist/index.js", "gateway", "--allow-unconfigured"]
+#   2. Override CMD: ["node","openclaw.mjs","gateway","--allow-unconfigured","--bind","lan"]
+CMD ["node", "openclaw.mjs", "gateway", "--allow-unconfigured"]

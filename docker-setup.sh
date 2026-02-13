@@ -53,10 +53,100 @@ export OPENCLAW_GATEWAY_TOKEN
 COMPOSE_FILES=("$COMPOSE_FILE")
 COMPOSE_ARGS=()
 
+# Memory plugin support: OPENCLAW_MEMORY=redis|lancedb|none (default: none)
+OPENCLAW_MEMORY="${OPENCLAW_MEMORY:-none}"
+export OPENCLAW_MEMORY
+
+case "$OPENCLAW_MEMORY" in
+  redis)
+    REDIS_COMPOSE_FILE="$ROOT_DIR/extensions/memory-redis/docker/docker-compose.yml"
+    if [[ -f "$REDIS_COMPOSE_FILE" ]]; then
+      COMPOSE_FILES+=("$REDIS_COMPOSE_FILE")
+      echo "==> Memory plugin: Redis (will auto-configure with redis://redis-stack:6379)"
+    else
+      echo "Error: Redis compose file not found at $REDIS_COMPOSE_FILE" >&2
+      exit 1
+    fi
+    ;;
+  lancedb)
+    echo "==> Memory plugin: LanceDB (embedded, no extra containers)"
+    echo "    Data will be stored in \$OPENCLAW_CONFIG_DIR/memory/lancedb"
+    ;;
+  none|"")
+    echo "==> Memory plugin: none (set OPENCLAW_MEMORY=redis or lancedb to enable)"
+    ;;
+  *)
+    echo "Error: Invalid OPENCLAW_MEMORY value '$OPENCLAW_MEMORY' (use: redis, lancedb, or none)" >&2
+    exit 1
+    ;;
+esac
+
+# Function to configure memory plugin in openclaw.json after onboarding
+configure_memory_plugin() {
+  local config_file="$OPENCLAW_CONFIG_DIR/openclaw.json"
+  [[ -f "$config_file" ]] || return 0
+
+  case "$OPENCLAW_MEMORY" in
+    redis)
+      echo "==> Configuring memory-redis plugin..."
+      # Use node to safely merge plugin config into existing JSON
+      node -e '
+        const fs = require("fs");
+        const configPath = process.argv[1];
+        const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+        
+        // Ensure plugins structure exists
+        config.plugins = config.plugins || {};
+        config.plugins.slots = config.plugins.slots || {};
+        config.plugins.entries = config.plugins.entries || {};
+        
+        // Set memory slot to use redis plugin
+        config.plugins.slots.memory = "memory-redis";
+        
+        // Configure the plugin
+        config.plugins.entries["memory-redis"] = {
+          config: {
+            redis: { url: "redis://redis-stack:6379" },
+            embedding: { provider: "local" },
+            autoRecall: true,
+            autoCapture: true
+          }
+        };
+        
+        fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n");
+        console.log("    Configured memory-redis with redis://redis-stack:6379");
+      ' "$config_file"
+      ;;
+    lancedb)
+      echo "==> Configuring memory-lancedb plugin..."
+      node -e '
+        const fs = require("fs");
+        const configPath = process.argv[1];
+        const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+        
+        config.plugins = config.plugins || {};
+        config.plugins.slots = config.plugins.slots || {};
+        config.plugins.entries = config.plugins.entries || {};
+        
+        config.plugins.slots.memory = "memory-lancedb";
+        config.plugins.entries["memory-lancedb"] = {
+          config: {
+            embedding: { provider: "local" },
+            autoRecall: true,
+            autoCapture: true
+          }
+        };
+        
+        fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n");
+        console.log("    Configured memory-lancedb with local embeddings");
+      ' "$config_file"
+      ;;
+  esac
+}
+
 write_extra_compose() {
   local home_volume="$1"
   shift
-  local -a mounts=("$@")
   local mount
 
   cat >"$EXTRA_COMPOSE_FILE" <<'YAML'
@@ -71,7 +161,7 @@ YAML
     printf '      - %s:/home/node/.openclaw/workspace\n' "$OPENCLAW_WORKSPACE_DIR" >>"$EXTRA_COMPOSE_FILE"
   fi
 
-  for mount in "${mounts[@]}"; do
+  for mount in "$@"; do
     printf '      - %s\n' "$mount" >>"$EXTRA_COMPOSE_FILE"
   done
 
@@ -86,7 +176,7 @@ YAML
     printf '      - %s:/home/node/.openclaw/workspace\n' "$OPENCLAW_WORKSPACE_DIR" >>"$EXTRA_COMPOSE_FILE"
   fi
 
-  for mount in "${mounts[@]}"; do
+  for mount in "$@"; do
     printf '      - %s\n' "$mount" >>"$EXTRA_COMPOSE_FILE"
   done
 
@@ -111,7 +201,12 @@ if [[ -n "$EXTRA_MOUNTS" ]]; then
 fi
 
 if [[ -n "$HOME_VOLUME_NAME" || ${#VALID_MOUNTS[@]} -gt 0 ]]; then
-  write_extra_compose "$HOME_VOLUME_NAME" "${VALID_MOUNTS[@]}"
+  # Bash 3.2 + nounset treats "${array[@]}" on an empty array as unbound.
+  if [[ ${#VALID_MOUNTS[@]} -gt 0 ]]; then
+    write_extra_compose "$HOME_VOLUME_NAME" "${VALID_MOUNTS[@]}"
+  else
+    write_extra_compose "$HOME_VOLUME_NAME"
+  fi
   COMPOSE_FILES+=("$EXTRA_COMPOSE_FILE")
 fi
 for compose_file in "${COMPOSE_FILES[@]}"; do
@@ -129,7 +224,9 @@ upsert_env() {
   local -a keys=("$@")
   local tmp
   tmp="$(mktemp)"
-  declare -A seen=()
+  # Use a delimited string instead of an associative array so the script
+  # works with Bash 3.2 (macOS default) which lacks `declare -A`.
+  local seen=" "
 
   if [[ -f "$file" ]]; then
     while IFS= read -r line || [[ -n "$line" ]]; do
@@ -138,7 +235,7 @@ upsert_env() {
       for k in "${keys[@]}"; do
         if [[ "$key" == "$k" ]]; then
           printf '%s=%s\n' "$k" "${!k-}" >>"$tmp"
-          seen["$k"]=1
+          seen="$seen$k "
           replaced=true
           break
         fi
@@ -150,7 +247,7 @@ upsert_env() {
   fi
 
   for k in "${keys[@]}"; do
-    if [[ -z "${seen[$k]:-}" ]]; then
+    if [[ "$seen" != *" $k "* ]]; then
       printf '%s=%s\n' "$k" "${!k-}" >>"$tmp"
     fi
   done
@@ -188,6 +285,10 @@ echo "  - Install Gateway daemon: No"
 echo ""
 docker compose "${COMPOSE_ARGS[@]}" run --rm openclaw-cli onboard --no-install-daemon
 
+# Configure memory plugin after onboarding creates the config file
+# (plugins are already bundled in the Docker image at /app/extensions/)
+configure_memory_plugin
+
 echo ""
 echo "==> Provider setup (optional)"
 echo "WhatsApp (QR):"
@@ -200,7 +301,11 @@ echo "Docs: https://docs.openclaw.ai/channels"
 
 echo ""
 echo "==> Starting gateway"
-docker compose "${COMPOSE_ARGS[@]}" up -d openclaw-gateway
+SERVICES_TO_START="openclaw-gateway"
+if [[ "$OPENCLAW_MEMORY" == "redis" ]]; then
+  SERVICES_TO_START="$SERVICES_TO_START redis-stack"
+fi
+docker compose "${COMPOSE_ARGS[@]}" up -d $SERVICES_TO_START
 
 echo ""
 echo "Gateway running with host port mapping."
