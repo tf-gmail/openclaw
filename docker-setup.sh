@@ -8,10 +8,53 @@ IMAGE_NAME="${OPENCLAW_IMAGE:-openclaw:local}"
 EXTRA_MOUNTS="${OPENCLAW_EXTRA_MOUNTS:-}"
 HOME_VOLUME_NAME="${OPENCLAW_HOME_VOLUME:-}"
 
+fail() {
+  echo "ERROR: $*" >&2
+  exit 1
+}
+
 require_cmd() {
   if ! command -v "$1" >/dev/null 2>&1; then
     echo "Missing dependency: $1" >&2
     exit 1
+  fi
+}
+
+contains_disallowed_chars() {
+  local value="$1"
+  [[ "$value" == *$'\n'* || "$value" == *$'\r'* || "$value" == *$'\t'* ]]
+}
+
+validate_mount_path_value() {
+  local label="$1"
+  local value="$2"
+  if [[ -z "$value" ]]; then
+    fail "$label cannot be empty."
+  fi
+  if contains_disallowed_chars "$value"; then
+    fail "$label contains unsupported control characters."
+  fi
+  if [[ "$value" =~ [[:space:]] ]]; then
+    fail "$label cannot contain whitespace."
+  fi
+}
+
+validate_named_volume() {
+  local value="$1"
+  if [[ ! "$value" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
+    fail "OPENCLAW_HOME_VOLUME must match [A-Za-z0-9][A-Za-z0-9_.-]* when using a named volume."
+  fi
+}
+
+validate_mount_spec() {
+  local mount="$1"
+  if contains_disallowed_chars "$mount"; then
+    fail "OPENCLAW_EXTRA_MOUNTS entries cannot contain control characters."
+  fi
+  # Keep mount specs strict to avoid YAML structure injection.
+  # Expected format: source:target[:options]
+  if [[ ! "$mount" =~ ^[^[:space:],:]+:[^[:space:],:]+(:[^[:space:],:]+)?$ ]]; then
+    fail "Invalid mount format '$mount'. Expected source:target[:options] without spaces."
   fi
 }
 
@@ -23,6 +66,19 @@ fi
 
 OPENCLAW_CONFIG_DIR="${OPENCLAW_CONFIG_DIR:-$HOME/.openclaw}"
 OPENCLAW_WORKSPACE_DIR="${OPENCLAW_WORKSPACE_DIR:-$HOME/.openclaw/workspace}"
+
+validate_mount_path_value "OPENCLAW_CONFIG_DIR" "$OPENCLAW_CONFIG_DIR"
+validate_mount_path_value "OPENCLAW_WORKSPACE_DIR" "$OPENCLAW_WORKSPACE_DIR"
+if [[ -n "$HOME_VOLUME_NAME" ]]; then
+  if [[ "$HOME_VOLUME_NAME" == *"/"* ]]; then
+    validate_mount_path_value "OPENCLAW_HOME_VOLUME" "$HOME_VOLUME_NAME"
+  else
+    validate_named_volume "$HOME_VOLUME_NAME"
+  fi
+fi
+if contains_disallowed_chars "$EXTRA_MOUNTS"; then
+  fail "OPENCLAW_EXTRA_MOUNTS cannot contain control characters."
+fi
 
 mkdir -p "$OPENCLAW_CONFIG_DIR"
 mkdir -p "$OPENCLAW_WORKSPACE_DIR"
@@ -53,11 +109,104 @@ export OPENCLAW_GATEWAY_TOKEN
 COMPOSE_FILES=("$COMPOSE_FILE")
 COMPOSE_ARGS=()
 
+# Memory plugin support: OPENCLAW_MEMORY=redis|lancedb|none (default: none)
+OPENCLAW_MEMORY="${OPENCLAW_MEMORY:-none}"
+export OPENCLAW_MEMORY
+
+case "$OPENCLAW_MEMORY" in
+  redis)
+    REDIS_COMPOSE_FILE="$ROOT_DIR/extensions/memory-redis/docker/docker-compose.yml"
+    if [[ -f "$REDIS_COMPOSE_FILE" ]]; then
+      COMPOSE_FILES+=("$REDIS_COMPOSE_FILE")
+      echo "==> Memory plugin: Redis (will auto-configure with redis://redis-stack:6379)"
+    else
+      echo "Error: Redis compose file not found at $REDIS_COMPOSE_FILE" >&2
+      exit 1
+    fi
+    ;;
+  lancedb)
+    echo "==> Memory plugin: LanceDB (embedded, no extra containers)"
+    echo "    Data will be stored in \$OPENCLAW_CONFIG_DIR/memory/lancedb"
+    ;;
+  none|"")
+    echo "==> Memory plugin: none (set OPENCLAW_MEMORY=redis or lancedb to enable)"
+    ;;
+  *)
+    echo "Error: Invalid OPENCLAW_MEMORY value '$OPENCLAW_MEMORY' (use: redis, lancedb, or none)" >&2
+    exit 1
+    ;;
+esac
+
+# Function to configure memory plugin in openclaw.json after onboarding
+configure_memory_plugin() {
+  local config_file="$OPENCLAW_CONFIG_DIR/openclaw.json"
+  [[ -f "$config_file" ]] || return 0
+
+  case "$OPENCLAW_MEMORY" in
+    redis)
+      echo "==> Configuring memory-redis plugin..."
+      # Use node to safely merge plugin config into existing JSON
+      node -e '
+        const fs = require("fs");
+        const configPath = process.argv[1];
+        const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+        
+        // Ensure plugins structure exists
+        config.plugins = config.plugins || {};
+        config.plugins.slots = config.plugins.slots || {};
+        config.plugins.entries = config.plugins.entries || {};
+        
+        // Set memory slot to use redis plugin
+        config.plugins.slots.memory = "memory-redis";
+        
+        // Configure the plugin
+        config.plugins.entries["memory-redis"] = {
+          config: {
+            redis: { url: "redis://redis-stack:6379" },
+            embedding: { provider: "local" },
+            autoRecall: true,
+            autoCapture: true
+          }
+        };
+        
+        fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n");
+        console.log("    Configured memory-redis with redis://redis-stack:6379");
+      ' "$config_file"
+      ;;
+    lancedb)
+      echo "==> Configuring memory-lancedb plugin..."
+      node -e '
+        const fs = require("fs");
+        const configPath = process.argv[1];
+        const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+        
+        config.plugins = config.plugins || {};
+        config.plugins.slots = config.plugins.slots || {};
+        config.plugins.entries = config.plugins.entries || {};
+        
+        config.plugins.slots.memory = "memory-lancedb";
+        config.plugins.entries["memory-lancedb"] = {
+          config: {
+            embedding: { provider: "local" },
+            autoRecall: true,
+            autoCapture: true
+          }
+        };
+        
+        fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n");
+        console.log("    Configured memory-lancedb with local embeddings");
+      ' "$config_file"
+      ;;
+  esac
+}
+
 write_extra_compose() {
   local home_volume="$1"
   shift
-  local -a mounts=("$@")
   local mount
+  local gateway_home_mount
+  local gateway_config_mount
+  local gateway_workspace_mount
 
   cat >"$EXTRA_COMPOSE_FILE" <<'YAML'
 services:
@@ -66,12 +215,19 @@ services:
 YAML
 
   if [[ -n "$home_volume" ]]; then
-    printf '      - %s:/home/node\n' "$home_volume" >>"$EXTRA_COMPOSE_FILE"
-    printf '      - %s:/home/node/.openclaw\n' "$OPENCLAW_CONFIG_DIR" >>"$EXTRA_COMPOSE_FILE"
-    printf '      - %s:/home/node/.openclaw/workspace\n' "$OPENCLAW_WORKSPACE_DIR" >>"$EXTRA_COMPOSE_FILE"
+    gateway_home_mount="${home_volume}:/home/node"
+    gateway_config_mount="${OPENCLAW_CONFIG_DIR}:/home/node/.openclaw"
+    gateway_workspace_mount="${OPENCLAW_WORKSPACE_DIR}:/home/node/.openclaw/workspace"
+    validate_mount_spec "$gateway_home_mount"
+    validate_mount_spec "$gateway_config_mount"
+    validate_mount_spec "$gateway_workspace_mount"
+    printf '      - %s\n' "$gateway_home_mount" >>"$EXTRA_COMPOSE_FILE"
+    printf '      - %s\n' "$gateway_config_mount" >>"$EXTRA_COMPOSE_FILE"
+    printf '      - %s\n' "$gateway_workspace_mount" >>"$EXTRA_COMPOSE_FILE"
   fi
 
-  for mount in "${mounts[@]}"; do
+  for mount in "$@"; do
+    validate_mount_spec "$mount"
     printf '      - %s\n' "$mount" >>"$EXTRA_COMPOSE_FILE"
   done
 
@@ -81,16 +237,18 @@ YAML
 YAML
 
   if [[ -n "$home_volume" ]]; then
-    printf '      - %s:/home/node\n' "$home_volume" >>"$EXTRA_COMPOSE_FILE"
-    printf '      - %s:/home/node/.openclaw\n' "$OPENCLAW_CONFIG_DIR" >>"$EXTRA_COMPOSE_FILE"
-    printf '      - %s:/home/node/.openclaw/workspace\n' "$OPENCLAW_WORKSPACE_DIR" >>"$EXTRA_COMPOSE_FILE"
+    printf '      - %s\n' "$gateway_home_mount" >>"$EXTRA_COMPOSE_FILE"
+    printf '      - %s\n' "$gateway_config_mount" >>"$EXTRA_COMPOSE_FILE"
+    printf '      - %s\n' "$gateway_workspace_mount" >>"$EXTRA_COMPOSE_FILE"
   fi
 
-  for mount in "${mounts[@]}"; do
+  for mount in "$@"; do
+    validate_mount_spec "$mount"
     printf '      - %s\n' "$mount" >>"$EXTRA_COMPOSE_FILE"
   done
 
   if [[ -n "$home_volume" && "$home_volume" != *"/"* ]]; then
+    validate_named_volume "$home_volume"
     cat >>"$EXTRA_COMPOSE_FILE" <<YAML
 volumes:
   ${home_volume}:
@@ -111,7 +269,12 @@ if [[ -n "$EXTRA_MOUNTS" ]]; then
 fi
 
 if [[ -n "$HOME_VOLUME_NAME" || ${#VALID_MOUNTS[@]} -gt 0 ]]; then
-  write_extra_compose "$HOME_VOLUME_NAME" "${VALID_MOUNTS[@]}"
+  # Bash 3.2 + nounset treats "${array[@]}" on an empty array as unbound.
+  if [[ ${#VALID_MOUNTS[@]} -gt 0 ]]; then
+    write_extra_compose "$HOME_VOLUME_NAME" "${VALID_MOUNTS[@]}"
+  else
+    write_extra_compose "$HOME_VOLUME_NAME"
+  fi
   COMPOSE_FILES+=("$EXTRA_COMPOSE_FILE")
 fi
 for compose_file in "${COMPOSE_FILES[@]}"; do
@@ -129,7 +292,9 @@ upsert_env() {
   local -a keys=("$@")
   local tmp
   tmp="$(mktemp)"
-  declare -A seen=()
+  # Use a delimited string instead of an associative array so the script
+  # works with Bash 3.2 (macOS default) which lacks `declare -A`.
+  local seen=" "
 
   if [[ -f "$file" ]]; then
     while IFS= read -r line || [[ -n "$line" ]]; do
@@ -138,7 +303,7 @@ upsert_env() {
       for k in "${keys[@]}"; do
         if [[ "$key" == "$k" ]]; then
           printf '%s=%s\n' "$k" "${!k-}" >>"$tmp"
-          seen["$k"]=1
+          seen="$seen$k "
           replaced=true
           break
         fi
@@ -150,7 +315,7 @@ upsert_env() {
   fi
 
   for k in "${keys[@]}"; do
-    if [[ -z "${seen[$k]:-}" ]]; then
+    if [[ "$seen" != *" $k "* ]]; then
       printf '%s=%s\n' "$k" "${!k-}" >>"$tmp"
     fi
   done
@@ -188,6 +353,10 @@ echo "  - Install Gateway daemon: No"
 echo ""
 docker compose "${COMPOSE_ARGS[@]}" run --rm openclaw-cli onboard --no-install-daemon
 
+# Configure memory plugin after onboarding creates the config file
+# (plugins are already bundled in the Docker image at /app/extensions/)
+configure_memory_plugin
+
 echo ""
 echo "==> Provider setup (optional)"
 echo "WhatsApp (QR):"
@@ -200,7 +369,11 @@ echo "Docs: https://docs.openclaw.ai/channels"
 
 echo ""
 echo "==> Starting gateway"
-docker compose "${COMPOSE_ARGS[@]}" up -d openclaw-gateway
+SERVICES_TO_START="openclaw-gateway"
+if [[ "$OPENCLAW_MEMORY" == "redis" ]]; then
+  SERVICES_TO_START="$SERVICES_TO_START redis-stack"
+fi
+docker compose "${COMPOSE_ARGS[@]}" up -d $SERVICES_TO_START
 
 echo ""
 echo "Gateway running with host port mapping."
